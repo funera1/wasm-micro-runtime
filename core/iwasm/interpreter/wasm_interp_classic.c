@@ -10,6 +10,8 @@
 #include "wasm_loader.h"
 #include "wasm_memory.h"
 #include "../common/wasm_exec_env.h"
+#include "../migration/wasm_dump.h"
+#include "../migration/wasm_restore.h"
 #if WASM_ENABLE_SHARED_MEMORY != 0
 #include "../common/wasm_shared_memory.h"
 #endif
@@ -319,43 +321,49 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
 #define PUSH_I32(value)                        \
     do {                                       \
         *(int32 *)frame_sp++ = (int32)(value); \
+        *(int32 *)frame_tsp++ = (int32)(0);    \
     } while (0)
 
 #define PUSH_F32(value)                            \
     do {                                           \
         *(float32 *)frame_sp++ = (float32)(value); \
+        *(int32 *)frame_tsp++ = (int32)(0);    \
     } while (0)
 
 #define PUSH_I64(value)                   \
     do {                                  \
         PUT_I64_TO_ADDR(frame_sp, value); \
         frame_sp += 2;                    \
+        *(int32 *)frame_tsp++ = (int32)(1);\
     } while (0)
 
 #define PUSH_F64(value)                   \
     do {                                  \
         PUT_F64_TO_ADDR(frame_sp, value); \
         frame_sp += 2;                    \
+        *(int32 *)frame_tsp++ = (int32)(1);\
     } while (0)
 
-#define PUSH_CSP(_label_type, param_cell_num, cell_num, _target_addr) \
+#define PUSH_CSP(_label_type, param_cell_num, pram_count, cell_num, ret_count, _target_addr) \
     do {                                                              \
         bh_assert(frame_csp < frame->csp_boundary);                   \
         /* frame_csp->label_type = _label_type; */                    \
         frame_csp->cell_num = cell_num;                               \
+        frame_csp->count = ret_count;                                 \
         frame_csp->begin_addr = frame_ip;                             \
         frame_csp->target_addr = _target_addr;                        \
         frame_csp->frame_sp = frame_sp - param_cell_num;              \
+        frame_csp->frame_tsp = frame_tsp - param_count;               \
         frame_csp++;                                                  \
     } while (0)
 
-#define POP_I32() (--frame_sp, *(int32 *)frame_sp)
+#define POP_I32() (--frame_sp, --frame_tsp, *(int32 *)frame_sp)
 
-#define POP_F32() (--frame_sp, *(float32 *)frame_sp)
+#define POP_F32() (--frame_sp, --frame_tsp, *(float32 *)frame_sp)
 
-#define POP_I64() (frame_sp -= 2, GET_I64_FROM_ADDR(frame_sp))
+#define POP_I64() (frame_sp -= 2, --frame_tsp, GET_I64_FROM_ADDR(frame_sp))
 
-#define POP_F64() (frame_sp -= 2, GET_F64_FROM_ADDR(frame_sp))
+#define POP_F64() (frame_sp -= 2, --frame_tsp, GET_F64_FROM_ADDR(frame_sp))
 
 #define POP_CSP_CHECK_OVERFLOW(n)                      \
     do {                                               \
@@ -371,7 +379,8 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
 #define POP_CSP_N(n)                                             \
     do {                                                         \
         uint32 *frame_sp_old = frame_sp;                         \
-        uint32 cell_num_to_copy;                                 \
+        uint32 *frame_tsp_old = frame_tsp;                       \
+        uint32 cell_num_to_copy, count_to_copy;                  \
         POP_CSP_CHECK_OVERFLOW(n + 1);                           \
         frame_csp -= n;                                          \
         frame_ip = (frame_csp - 1)->target_addr;                 \
@@ -382,14 +391,25 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
             word_copy(frame_sp, frame_sp_old - cell_num_to_copy, \
                       cell_num_to_copy);                         \
         }                                                        \
+        frame_tsp = (frame_csp - 1)->frame_tsp;                  \
+        count_to_copy = (frame_csp - 1)->count;                  \
+        if (count_to_copy > 0) {                                 \
+            word_copy(frame_tsp, frame_tsp_old - count_to_copy,  \
+                      count_to_copy);                            \
+        }                                                        \
         frame_sp += cell_num_to_copy;                            \
+        frame_tsp += count_to_copy;                              \
+        bh_assert((int32)(frame_sp-frame->sp_bottom              \
+                ==(int32)(frame_tsp-frame->tsp_bottom)));        \
     } while (0)
 
 /* Pop the given number of elements from the given frame's stack.  */
-#define POP(N)         \
-    do {               \
-        int n = (N);   \
-        frame_sp -= n; \
+#define POP(cell_num, count)         \
+    do {                             \
+        int n = (cell_num);          \
+        int m = (count);             \
+        frame_sp -= n;               \
+        frame_tsp -= m;              \
     } while (0)
 
 #define SYNC_ALL_TO_FRAME()     \
@@ -397,6 +417,7 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         frame->sp = frame_sp;   \
         frame->ip = frame_ip;   \
         frame->csp = frame_csp; \
+        frame->tsp = frame_tsp; \
     } while (0)
 
 #define UPDATE_ALL_FROM_FRAME() \
@@ -404,6 +425,7 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         frame_sp = frame->sp;   \
         frame_ip = frame->ip;   \
         frame_csp = frame->csp; \
+        frame_tsp = frame->tsp; \
     } while (0)
 
 #define read_leb_int64(p, p_end, res)              \
@@ -466,6 +488,7 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         RECOVER_FRAME_IP_END();         \
         frame_lp = frame->lp;           \
         frame_sp = frame->sp;           \
+        frame_tsp = frame->tsp;         \
         frame_csp = frame->csp;         \
     } while (0)
 
@@ -512,6 +535,9 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         frame_sp -= sizeof(src_type2) / sizeof(uint32);               \
         *(src_type1 *)(frame_sp - sizeof(src_type1) / sizeof(uint32)) \
             operation## = *(src_type2 *)(frame_sp);                   \
+        frame_tsp -= 2;                                               \
+        *frame_tsp = (sizeof(src_type1) == 8);                        \
+        frame_tsp++;                                                  \
     } while (0)
 
 #if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0
@@ -526,6 +552,9 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         val2 = (src_type2)GET_##src_op_type##_FROM_ADDR(frame_sp);      \
         val1 operation## = val2;                                        \
         PUT_##src_op_type##_TO_ADDR(frame_sp - 2, val1);                \
+        frame_tsp -= 2;                                               \
+        *frame_tsp = (sizeof(src_type1) == 8);                        \
+        frame_tsp++;                                                  \
     } while (0)
 #endif
 
@@ -534,6 +563,9 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         frame_sp -= sizeof(src_type2) / sizeof(uint32);               \
         *(src_type1 *)(frame_sp - sizeof(src_type1) / sizeof(uint32)) \
             operation## = (*(src_type2 *)(frame_sp) % 32);            \
+        frame_tsp -= 2;                                               \
+        *frame_tsp = (sizeof(src_type1) == 8);                        \
+        frame_tsp++;                                                  \
     } while (0)
 
 #define DEF_OP_NUMERIC2_64(src_type1, src_type2, src_op_type, operation) \
@@ -545,6 +577,9 @@ read_leb(const uint8 *buf, uint32 *p_offset, uint32 maxbits, bool sign)
         val2 = (src_type2)GET_##src_op_type##_FROM_ADDR(frame_sp);       \
         val1 operation## = (val2 % 64);                                  \
         PUT_##src_op_type##_TO_ADDR(frame_sp - 2, val1);                 \
+        frame_tsp -= 2;                                               \
+        *frame_tsp = (sizeof(src_type1) == 8);                        \
+        frame_tsp++;                                                  \
     } while (0)
 
 #define DEF_OP_MATH(src_type, src_op_type, method) \
@@ -581,7 +616,7 @@ TRUNC_FUNCTION(trunc_f64_to_i32, float64, uint32, int32)
 TRUNC_FUNCTION(trunc_f64_to_i64, float64, uint64, int64)
 
 static bool
-trunc_f32_to_int(WASMModuleInstance *module, uint32 *frame_sp, float32 src_min,
+trunc_f32_to_int(WASMModuleInstance *module, uint32 *frame_sp, uint32 *frame_tsp, float32 src_min,
                  float32 src_max, bool saturating, bool is_i32, bool is_sign)
 {
     float32 src_value = POP_F32();
@@ -617,7 +652,7 @@ trunc_f32_to_int(WASMModuleInstance *module, uint32 *frame_sp, float32 src_min,
 }
 
 static bool
-trunc_f64_to_int(WASMModuleInstance *module, uint32 *frame_sp, float64 src_min,
+trunc_f64_to_int(WASMModuleInstance *module, uint32 *frame_sp, uint32 *frame_tsp, float64 src_min,
                  float64 src_max, bool saturating, bool is_i32, bool is_sign)
 {
     float64 src_value = POP_F64();
@@ -654,27 +689,27 @@ trunc_f64_to_int(WASMModuleInstance *module, uint32 *frame_sp, float64 src_min,
 
 #define DEF_OP_TRUNC_F32(min, max, is_i32, is_sign)                      \
     do {                                                                 \
-        if (!trunc_f32_to_int(module, frame_sp, min, max, false, is_i32, \
+        if (!trunc_f32_to_int(module, frame_sp, frame_tsp, min, max, false, is_i32, \
                               is_sign))                                  \
             goto got_exception;                                          \
     } while (0)
 
 #define DEF_OP_TRUNC_F64(min, max, is_i32, is_sign)                      \
     do {                                                                 \
-        if (!trunc_f64_to_int(module, frame_sp, min, max, false, is_i32, \
+        if (!trunc_f64_to_int(module, frame_sp, frame_tsp, min, max, false, is_i32, \
                               is_sign))                                  \
             goto got_exception;                                          \
     } while (0)
 
 #define DEF_OP_TRUNC_SAT_F32(min, max, is_i32, is_sign)                  \
     do {                                                                 \
-        (void)trunc_f32_to_int(module, frame_sp, min, max, true, is_i32, \
+        (void)trunc_f32_to_int(module, frame_sp, frame_tsp, min, max, true, is_i32, \
                                is_sign);                                 \
     } while (0)
 
 #define DEF_OP_TRUNC_SAT_F64(min, max, is_i32, is_sign)                  \
     do {                                                                 \
-        (void)trunc_f64_to_int(module, frame_sp, min, max, true, is_i32, \
+        (void)trunc_f64_to_int(module, frame_sp, frame_tsp, min, max, true, is_i32, \
                                is_sign);                                 \
     } while (0)
 
@@ -948,11 +983,16 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
     if (cur_func->ret_cell_num == 1) {
         prev_frame->sp[0] = argv_ret[0];
         prev_frame->sp++;
+        prev_frame->tsp[0] = 0;
+        prev_frame->tsp++;
     }
     else if (cur_func->ret_cell_num == 2) {
         prev_frame->sp[0] = argv_ret[0];
         prev_frame->sp[1] = argv_ret[1];
         prev_frame->sp += 2;
+        prev_frame->tsp[0] = 0;
+        prev_frame->tsp[1] = 0;
+        prev_frame->tsp += 2;
     }
 
     FREE_FRAME(exec_env, frame);
@@ -1093,11 +1133,38 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
     } while (0)
 #endif /* WASM_ENABLE_DEBUG_INTERP */
 #endif /* WASM_ENABLE_THREAD_MGR */
+    
+        // uint32 ip_ofs = get_opcode_offset(wasm_get_func_code(cur_func), frame_ip); \
+        // printf("fidx: %d\n", fidx);                                             \
+        // printf("code line: %d\n", ip_ofs);                                      \
+
+#if BH_DEBUG != 0
+#define DISPATCH_LIMIT()                                                        \
+    do {                                                                        \
+        if (dispatch_count == dispatch_limit) {                                 \
+            sig_flag = true;                                                    \
+        }                                                                       \
+    } while(0);
+#else
+#define DISPATCH_LIMIT() 
+#endif
+    
+
+#define CHECK_DUMP()                                                        \
+    DISPATCH_LIMIT()                                                        \
+    if (sig_flag) {                                                         \
+        goto migration_async;                                               \
+    }
 
 #if WASM_ENABLE_LABELS_AS_VALUES != 0
 
 #define HANDLE_OP(opcode) HANDLE_##opcode:
-#define FETCH_OPCODE_AND_DISPATCH() goto *handle_table[*frame_ip++]
+#define FETCH_OPCODE_AND_DISPATCH()                                     \
+do {                                                                    \
+    dispatch_count++;                                                   \
+    CHECK_DUMP()                                                        \
+    goto *handle_table[*frame_ip++];                                    \
+} while(0);
 
 #if WASM_ENABLE_THREAD_MGR != 0 && WASM_ENABLE_DEBUG_INTERP != 0
 #define HANDLE_OP_END()                                                   \
@@ -1113,10 +1180,36 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
             wasm_cluster_thread_waiting_run(exec_env);                    \
         }                                                                 \
         os_mutex_unlock(&exec_env->wait_lock);                            \
+        CHECK_DUMP()                                                      \
         goto *handle_table[*frame_ip++];                                  \
     } while (0)
 #else
-#define HANDLE_OP_END() FETCH_OPCODE_AND_DISPATCH()
+uint32 tsp_size, sp_size;
+#if BH_DEBUG != 0
+#define CHECK_TYPE_STACK()                                                  \
+    LOG_VERBOSE("ip: 0x%x\n", *frame_ip);                                   \
+    tsp_size = frame_tsp - frame->tsp_bottom;                               \
+    sp_size = frame_sp - frame->sp_bottom;                                  \
+    if (sp_size < tsp_size                                                  \
+        || (sp_size == 0 && tsp_size > 0)                                   \
+        || (sp_size > 0 && tsp_size == 0)) {                                \
+       uint32 ip_ofs = get_opcode_offset(wasm_get_func_code(cur_func), frame_ip); \
+       printf("fidx: %d\n", fidx);                                          \
+       printf("code line: %d\n", ip_ofs);                                   \
+       printf("ip: 0x%x\n", *frame_ip);                                     \
+       printf("frame_tsp size: %ld\n", frame_tsp-frame->tsp_bottom);        \
+       printf("frame_sp size: %ld\n", frame_sp-frame->sp_bottom);           \
+       bh_assert(0);                                                        \
+    }
+#else
+#define CHECK_TYPE_STACK()
+#endif
+
+#define HANDLE_OP_END()                                                     \
+    do {                                                                    \
+        CHECK_TYPE_STACK()                                                  \
+        FETCH_OPCODE_AND_DISPATCH()                                         \
+    } while(0);
 #endif
 
 #else /* else of WASM_ENABLE_LABELS_AS_VALUES */
@@ -1131,9 +1224,12 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
         wasm_cluster_thread_waiting_run(exec_env);                 \
     }                                                              \
     os_mutex_unlock(&exec_env->wait_lock);                         \
+    CHECK_DUMP()                                                   \
     continue
 #else
-#define HANDLE_OP_END() continue
+#define HANDLE_OP_END()                                            \
+    CHECK_DUMP()                                                   \
+    continue
 #endif
 
 #endif /* end of WASM_ENABLE_LABELS_AS_VALUES */
@@ -1149,6 +1245,15 @@ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
                      + global->import_global_inst->data_offset
                : global_data + global->data_offset;
 #endif
+}
+
+static bool sig_flag = false;
+static void (*native_handler)(void) = NULL;
+bool done_flag = false;
+void
+wasm_interp_sigint(int signum)
+{
+    sig_flag = true;
 }
 
 static void
@@ -1170,9 +1275,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     WASMInterpFrame *frame = NULL;
     /* Points to this special opcode so as to jump to the
      * call_method_from_entry.  */
-    register uint8 *frame_ip = &opcode_IMPDEP; /* cache of frame->ip */
-    register uint32 *frame_lp = NULL;          /* cache of frame->lp */
-    register uint32 *frame_sp = NULL;          /* cache of frame->sp */
+    uint8 *frame_ip = &opcode_IMPDEP; /* cache of frame->ip */
+    uint32 *frame_lp = NULL;          /* cache of frame->lp */
+    uint32 *frame_sp = NULL;          /* cache of frame->sp */
+    uint32 *frame_tsp = NULL;
     WASMBranchBlock *frame_csp = NULL;
     BlockAddr *cache_items;
     uint8 *frame_ip_end = frame_ip + 1;
@@ -1184,7 +1290,10 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     uint32 local_idx, local_offset, global_idx;
     uint8 local_type, *global_addr;
     uint32 cache_index, type_index, param_cell_num, cell_num;
+    uint32 param_count, result_count;
     uint8 value_type;
+    uint32 dispatch_count = 0;
+    uint32 dispatch_limit = -1;
 #if !defined(OS_ENABLE_HW_BOUND_CHECK) \
     || WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS == 0
 #if WASM_CONFIGUABLE_BOUNDS_CHECKS != 0
@@ -1210,11 +1319,74 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #undef HANDLE_OPCODE
 #endif
 
+    signal(SIGINT, &wasm_interp_sigint);
+
+    if (get_restore_flag()) {
+        // bool done_flag;
+        int rc;
+        frame = wasm_restore_frame(&exec_env);
+        if (frame == NULL) {
+            perror("Error:wasm_interp_func_bytecode:frame is NULL\n");
+            return;
+        }
+        // debug_wasm_interp_frame(frame, module->e->functions);
+
+        cur_func = frame->function;
+        prev_frame = frame->prev_frame;
+        if (cur_func == NULL) {
+            perror("Error:wasm_interp_func_bytecode:cur_func is null\n");
+            return;
+        }
+        if (prev_frame == NULL) {
+            perror("Error:wasm_interp_func_bytecode:prev_frame is null\n");
+            return;
+        }
+
+        rc = wasm_restore(&module, &exec_env, &cur_func, &prev_frame,
+                        &memory, &globals, &global_data, &global_addr,
+                        &frame, &frame_ip, &frame_lp, &frame_sp, &frame_csp,
+                        &frame_ip_end, &else_addr, &end_addr, &maddr, &done_flag);
+        if (rc < 0) {
+            // error
+            perror("failed to restore\n");
+            return;
+        }
+        linear_mem_size = memory ? memory->memory_data_size : 0;
+
+        rc = wasm_restore_tsp_addr(&frame_tsp, frame);
+        if (rc < 0) {
+            // error
+            perror("failed to restore_tsp\n");
+            return;
+        }
+
+        UPDATE_ALL_FROM_FRAME();
+        FETCH_OPCODE_AND_DISPATCH();
+    }
+
+
 #if WASM_ENABLE_LABELS_AS_VALUES == 0
     while (frame_ip < frame_ip_end) {
-        opcode = *frame_ip++;
+restore_point:
+    step++;
+    frame_prev_ip = frame_ip;
+    opcode = *frame_ip++;
         switch (opcode) {
 #else
+migration_async:
+    if (sig_flag) {
+        SYNC_ALL_TO_FRAME();
+        int rc = wasm_dump(exec_env, module, memory, 
+            globals, global_data, global_addr, cur_func,
+            frame, frame_ip, frame_sp, frame_csp, frame_tsp,
+            frame_ip_end, else_addr, end_addr, maddr, done_flag);
+        if (rc < 0) {
+            perror("failed to dump\n");
+            exit(1);
+        }
+        LOG_DEBUG("dispatch_count: %d\n", dispatch_count);
+        exit(0);     
+    }
     FETCH_OPCODE_AND_DISPATCH();
 #endif
             /* control instructions */
@@ -1238,7 +1410,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 value_type = *frame_ip++;
                 param_cell_num = 0;
+                param_count = 0;
                 cell_num = wasm_value_type_cell_num(value_type);
+                result_count = cell_num ? 1 : 0;
             handle_op_block:
                 cache_index = ((uintptr_t)frame_ip)
                               & (uintptr_t)(BLOCK_ADDR_CACHE_SIZE - 1);
@@ -1261,7 +1435,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 else {
                     end_addr = NULL;
                 }
-                PUSH_CSP(LABEL_TYPE_BLOCK, param_cell_num, cell_num, end_addr);
+                PUSH_CSP(LABEL_TYPE_BLOCK, param_cell_num, param_count, cell_num, result_count, end_addr);
                 HANDLE_OP_END();
             }
 
@@ -1269,7 +1443,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num = wasm_types[type_index]->param_cell_num;
+                param_count = wasm_types[type_index]->param_count;
                 cell_num = wasm_types[type_index]->param_cell_num;
+                result_count = wasm_types[type_index]->result_count;
                 goto handle_op_loop;
             }
 
@@ -1277,9 +1453,11 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 value_type = *frame_ip++;
                 param_cell_num = 0;
+                param_count = 0;
                 cell_num = 0;
+                result_count = 0;
             handle_op_loop:
-                PUSH_CSP(LABEL_TYPE_LOOP, param_cell_num, cell_num, frame_ip);
+                PUSH_CSP(LABEL_TYPE_LOOP, param_cell_num, param_count, cell_num, result_count, frame_ip);
                 HANDLE_OP_END();
             }
 
@@ -1287,7 +1465,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 read_leb_uint32(frame_ip, frame_ip_end, type_index);
                 param_cell_num = wasm_types[type_index]->param_cell_num;
+                param_count = wasm_types[type_index]->param_count;
                 cell_num = wasm_types[type_index]->ret_cell_num;
+                result_count = wasm_types[type_index]->result_count;
                 goto handle_op_if;
             }
 
@@ -1295,7 +1475,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 value_type = *frame_ip++;
                 param_cell_num = 0;
+                param_count = 0;
                 cell_num = wasm_value_type_cell_num(value_type);
+                result_count = cell_num ? 1 : 0;
             handle_op_if:
                 cache_index = ((uintptr_t)frame_ip)
                               & (uintptr_t)(BLOCK_ADDR_CACHE_SIZE - 1);
@@ -1319,7 +1501,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 cond = (uint32)POP_I32();
 
                 if (cond) { /* if branch is met */
-                    PUSH_CSP(LABEL_TYPE_IF, param_cell_num, cell_num, end_addr);
+                    PUSH_CSP(LABEL_TYPE_IF, param_cell_num, param_count, cell_num, result_count, end_addr);
                 }
                 else { /* if branch is not met */
                     /* if there is no else branch, go to the end addr */
@@ -1328,7 +1510,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                     }
                     /* if there is an else branch, go to the else addr */
                     else {
-                        PUSH_CSP(LABEL_TYPE_IF, param_cell_num, cell_num,
+                        PUSH_CSP(LABEL_TYPE_IF, param_cell_num, param_count, cell_num, result_count,
                                  end_addr);
                         frame_ip = else_addr + 1;
                     }
@@ -1350,8 +1532,13 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
                 else { /* end of function, treat as WASM_OP_RETURN */
                     frame_sp -= cur_func->ret_cell_num;
+                    frame_tsp -= cur_func->result_count;
+
                     for (i = 0; i < cur_func->ret_cell_num; i++) {
                         *prev_frame->sp++ = frame_sp[i];
+                    }
+                    for (i = 0; i < cur_func->result_count; i++) {
+                        *prev_frame->tsp++ = frame_tsp[i];
                     }
                     goto return_func;
                 }
@@ -1388,6 +1575,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 cond = (uint32)POP_I32();
                 if (cond)
                     goto label_pop_csp_n;
+
                 HANDLE_OP_END();
             }
 
@@ -1400,44 +1588,28 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 lidx = POP_I32();
                 if (lidx > count)
                     lidx = count;
-                depth = frame_ip[lidx];
+                for (i = 0; i < lidx; i++)
+                    skip_leb(frame_ip);
+                read_leb_uint32(frame_ip, frame_ip_end, depth);
                 goto label_pop_csp_n;
-            }
-
-            HANDLE_OP(EXT_OP_BR_TABLE_CACHE)
-            {
-                BrTableCache *node_cache =
-                    bh_list_first_elem(module->module->br_table_cache_list);
-                BrTableCache *node_next;
-
-#if WASM_ENABLE_THREAD_MGR != 0
-                CHECK_SUSPEND_FLAGS();
-#endif
-                lidx = POP_I32();
-
-                while (node_cache) {
-                    node_next = bh_list_elem_next(node_cache);
-                    if (node_cache->br_table_op_addr == frame_ip - 1) {
-                        depth = node_cache->br_depths[lidx];
-                        goto label_pop_csp_n;
-                    }
-                    node_cache = node_next;
-                }
-                bh_assert(0);
-                HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_RETURN)
             {
                 frame_sp -= cur_func->ret_cell_num;
+                frame_tsp -= cur_func->result_count;
                 for (i = 0; i < cur_func->ret_cell_num; i++) {
                     *prev_frame->sp++ = frame_sp[i];
+                }
+                for (i = 0; i < cur_func->result_count; i++) {
+                    *prev_frame->tsp++ = frame_tsp[i];
                 }
                 goto return_func;
             }
 
             HANDLE_OP(WASM_OP_CALL)
             {
+            handle_op_call:
 #if WASM_ENABLE_THREAD_MGR != 0
                 CHECK_SUSPEND_FLAGS();
 #endif
@@ -1449,6 +1621,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
 #endif
 
+                LOG_DEBUG("Enter func idx: %d\n",fidx);
                 cur_func = module->e->functions + fidx;
                 goto call_func_from_interp;
             }
@@ -1548,12 +1721,14 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_DROP)
             {
                 frame_sp--;
+                frame_tsp--;
                 HANDLE_OP_END();
             }
 
             HANDLE_OP(WASM_OP_DROP_64)
             {
                 frame_sp -= 2;
+                frame_tsp--;
                 HANDLE_OP_END();
             }
 
@@ -1561,6 +1736,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 cond = (uint32)POP_I32();
                 frame_sp--;
+                frame_tsp--;
                 if (!cond)
                     *(frame_sp - 1) = *frame_sp;
                 HANDLE_OP_END();
@@ -1570,6 +1746,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 cond = (uint32)POP_I32();
                 frame_sp -= 2;
+                frame_tsp--;
                 if (!cond) {
                     *(frame_sp - 2) = *frame_sp;
                     *(frame_sp - 1) = *(frame_sp + 1);
@@ -1589,6 +1766,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 cond = (uint32)POP_I32();
                 if (type == VALUE_TYPE_I64 || type == VALUE_TYPE_F64) {
                     frame_sp -= 2;
+                    frame_tsp--;
                     if (!cond) {
                         *(frame_sp - 2) = *frame_sp;
                         *(frame_sp - 1) = *(frame_sp + 1);
@@ -1791,6 +1969,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 bh_assert(global_idx < module->e->global_count);
                 global = globals + global_idx;
                 global_addr = get_global_addr(global_data, global);
+                
                 PUSH_I32(*(uint32 *)global_addr);
                 HANDLE_OP_END();
             }
@@ -1835,6 +2014,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 }
                 *(int32 *)global_addr = aux_stack_top;
                 frame_sp--;
+                frame_tsp--;
 #if WASM_ENABLE_MEMORY_PROFILING != 0
                 if (module->module->aux_stack_top_global_index != (uint32)-1) {
                     uint32 aux_stack_used = module->module->aux_stack_bottom
@@ -2037,6 +2217,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 read_leb_uint32(frame_ip, frame_ip_end, flags);
                 read_leb_uint32(frame_ip, frame_ip_end, offset);
                 frame_sp--;
+                frame_tsp--;
                 addr = POP_I32();
                 CHECK_MEMORY_OVERFLOW(4);
                 STORE_U32(maddr, frame_sp[1]);
@@ -2053,6 +2234,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 read_leb_uint32(frame_ip, frame_ip_end, flags);
                 read_leb_uint32(frame_ip, frame_ip_end, offset);
                 frame_sp -= 2;
+                frame_tsp--;
                 addr = POP_I32();
                 CHECK_MEMORY_OVERFLOW(8);
                 PUT_I64_TO_ADDR((uint32 *)maddr,
@@ -2156,7 +2338,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             }
 
             /* constant instructions */
-            HANDLE_OP(WASM_OP_I32_CONST)
+            HANDLE_OP(WASM_OP_I32_CONST);
             DEF_OP_I_CONST(int32, I32);
             HANDLE_OP_END();
 
@@ -2167,6 +2349,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             HANDLE_OP(WASM_OP_F32_CONST)
             {
                 uint8 *p_float = (uint8 *)frame_sp++;
+                *frame_tsp++ = (int32)(0);
                 for (i = 0; i < sizeof(float32); i++)
                     *p_float++ = *frame_ip++;
                 HANDLE_OP_END();
@@ -2176,6 +2359,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             {
                 uint8 *p_float = (uint8 *)frame_sp++;
                 frame_sp++;
+                *frame_tsp++ = (int32)(1);
                 for (i = 0; i < sizeof(float64); i++)
                     *p_float++ = *frame_ip++;
                 HANDLE_OP_END();
@@ -3111,10 +3295,12 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                         DEF_OP_TRUNC_SAT_F64(-2147483649.0, 2147483648.0, true,
                                              true);
                         frame_sp--;
+                        frame_tsp--;
                         break;
                     case WASM_OP_I32_TRUNC_SAT_U_F64:
                         DEF_OP_TRUNC_SAT_F64(-1.0, 4294967296.0, true, false);
                         frame_sp--;
+                        frame_tsp--;
                         break;
                     case WASM_OP_I64_TRUNC_SAT_S_F32:
                         DEF_OP_TRUNC_SAT_F32(-9223373136366403584.0f,
@@ -3784,6 +3970,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                 frame = prev_frame;
                 frame_ip = frame->ip;
                 frame_sp = frame->sp;
+                frame_tsp = frame->tsp;
                 frame_csp = frame->csp;
                 goto call_func_from_entry;
             }
@@ -3856,7 +4043,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #if WASM_ENABLE_TAIL_CALL != 0
     call_func_from_return_call:
     {
-        POP(cur_func->param_cell_num);
+        POP(cur_func->param_cell_num, cur_func->param_count);
         if (cur_func->param_cell_num > 0) {
             word_copy(frame->lp, frame_sp, cur_func->param_cell_num);
         }
@@ -3869,12 +4056,16 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
     {
         /* Only do the copy when it's called from interpreter.  */
         WASMInterpFrame *outs_area = wasm_exec_env_wasm_stack_top(exec_env);
-        POP(cur_func->param_cell_num);
+        POP(cur_func->param_cell_num, cur_func->param_count);
         SYNC_ALL_TO_FRAME();
+        // printf("tsp_addr: %p\n", frame->tsp);
+        // printf("dump tsp num: %d\n", frame->tsp - frame->tsp_bottom);
         if (cur_func->param_cell_num > 0) {
             word_copy(outs_area->lp, frame_sp, cur_func->param_cell_num);
         }
         prev_frame = frame;
+        if (frame->tsp != NULL && frame->tsp_bottom != NULL)
+            bh_assert(frame->tsp - frame->tsp_bottom >= 0);
     }
 
     call_func_from_entry:
@@ -3916,7 +4107,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             all_cell_num = cur_func->param_cell_num + cur_func->local_cell_num
                            + cur_wasm_func->max_stack_cell_num
                            + cur_wasm_func->max_block_num
-                                 * (uint32)sizeof(WASMBranchBlock) / 4;
+                                 * (uint32)sizeof(WASMBranchBlock) / 4
+                           + cur_wasm_func->max_stack_cell_num; // tsp size.
+
             /* param_cell_num, local_cell_num, max_stack_cell_num and
                max_block_num are all no larger than UINT16_MAX (checked
                in loader), all_cell_num must be smaller than 1MB */
@@ -3944,13 +4137,22 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             frame->csp_boundary =
                 frame->csp_bottom + cur_wasm_func->max_block_num;
 
+            frame_tsp = frame->tsp_bottom = 
+                (uint32 *)frame->csp_boundary;
+            frame->tsp_boundary = 
+                frame->tsp_bottom + cur_wasm_func->max_stack_cell_num;
+            frame->vpos = prev_frame->vpos + (uint32)(prev_frame->tsp - prev_frame->tsp_bottom) 
+                        + cur_func->local_count + cur_func->param_count;
+
             /* Initialize the local variables */
             memset(frame_lp + cur_func->param_cell_num, 0,
                    (uint32)(cur_func->local_cell_num * 4));
 
             /* Push function block as first block */
             cell_num = func_type->ret_cell_num;
-            PUSH_CSP(LABEL_TYPE_FUNCTION, 0, cell_num, frame_ip_end - 1);
+            result_count = func_type->result_count;
+
+            PUSH_CSP(LABEL_TYPE_FUNCTION, 0, 0, cell_num, result_count, frame_ip_end - 1);
 
             wasm_exec_env_set_cur_frame(exec_env, frame);
         }
@@ -3962,6 +4164,7 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 
     return_func:
     {
+        LOG_DEBUG("Exit func idx: %d\n",fidx);
         FREE_FRAME(exec_env, frame);
         wasm_exec_env_set_cur_frame(exec_env, prev_frame);
 
@@ -4235,6 +4438,9 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
     if (!(frame = ALLOC_FRAME(exec_env, frame_size, prev_frame)))
         return;
 
+    // wasm_dump's function
+    set_all_cell_num_of_dummy_frame(all_cell_num);
+
     outs_area = wasm_exec_env_wasm_stack_top(exec_env);
     frame->function = NULL;
     frame->ip = NULL;
@@ -4274,6 +4480,12 @@ wasm_interp_call_wasm(WASMModuleInstance *module_inst, WASMExecEnv *exec_env,
             wasm_interp_call_func_native(module_inst, exec_env, function,
                                          frame);
         }
+        // if (!done_flag) {
+            // *frame = pframe;
+            // UPDATE_ALL_FROM_FRAME();
+            // goto migration_async;
+        // } 
+
     }
     else {
         RunningMode running_mode =
