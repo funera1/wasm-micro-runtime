@@ -10,6 +10,8 @@
 #include "wasm_loader.h"
 #include "wasm_memory.h"
 #include "../common/wasm_exec_env.h"
+#include "../migration/wasm_dump.h"
+#include "../migration/wasm_restore.h"
 #if WASM_ENABLE_SHARED_MEMORY != 0
 #include "../common/wasm_shared_memory.h"
 #endif
@@ -1151,6 +1153,15 @@ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
 #endif
 }
 
+static bool sig_flag = false;
+static void (*native_handler)(void) = NULL;
+bool done_flag = false;
+void
+wasm_interp_sigint(int signum)
+{
+    sig_flag = true;
+}
+
 static void
 wasm_interp_call_func_bytecode(WASMModuleInstance *module,
                                WASMExecEnv *exec_env,
@@ -1210,11 +1221,66 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 #undef HANDLE_OPCODE
 #endif
 
+    signal(SIGINT, &wasm_interp_sigint);
+
+    if (get_restore_flag()) {
+        // bool done_flag;
+        int rc;
+
+        frame = wasm_restore_stack(&exec_env);
+        if (frame == NULL) {
+            perror("Error:wasm_interp_func_bytecode:frame is NULL\n");
+            return;
+        }
+        // debug_wasm_interp_frame(frame, module->e->functions);
+
+        cur_func = frame->function;
+        prev_frame = frame->prev_frame;
+        if (cur_func == NULL) {
+            perror("Error:wasm_interp_func_bytecode:cur_func is null\n");
+            return;
+        }
+        if (prev_frame == NULL) {
+            perror("Error:wasm_interp_func_bytecode:prev_frame is null\n");
+            return;
+        }
+
+        // rc = wasm_restore(&module, &exec_env, &cur_func, &prev_frame,
+        //                 &memory, &globals, &global_data, &global_addr,
+        //                 &frame, &frame_ip, &frame_lp, &frame_sp, &frame_csp,
+        //                 &frame_ip_end, &else_addr, &end_addr, &maddr, &done_flag);
+        // if (rc < 0) {
+        //     // error
+        //     perror("failed to restore\n");
+        //     return;
+        // }
+        frame->ip = frame_ip;
+        linear_mem_size = memory ? memory->memory_data_size : 0;
+
+        frame_lp = frame->lp;
+        UPDATE_ALL_FROM_FRAME();
+        FETCH_OPCODE_AND_DISPATCH();
+    }
+
 #if WASM_ENABLE_LABELS_AS_VALUES == 0
     while (frame_ip < frame_ip_end) {
         opcode = *frame_ip++;
         switch (opcode) {
 #else
+migration_async:
+    if (sig_flag) {
+        SYNC_ALL_TO_FRAME();
+        // int rc = wasm_dump(exec_env, module, memory, 
+        //     globals, global_data, global_addr, cur_func,
+        //     frame, frame_ip, frame_sp, frame_csp,
+        //     frame_ip_end, else_addr, end_addr, maddr, done_flag);
+        // if (rc < 0) {
+        //     perror("failed to dump\n");
+        //     exit(1);
+        // }
+        LOG_DEBUG("dispatch_count: %d\n", dispatch_count);
+        exit(0);     
+    }
     FETCH_OPCODE_AND_DISPATCH();
 #endif
             /* control instructions */
