@@ -208,64 +208,8 @@ _dump_stack(WASMExecEnv *exec_env, struct WASMInterpFrame *frame, struct FILE *f
     uint32 offset_now = frame->ip - wasm_get_func_code(frame->function);
     // printf("[DEBUG]now addr: (%d, %d)\n", fidx_now, offset_now);
     uint8* type_stack_from_file = get_type_stack(fidx_now, offset_now, &type_stack_size_from_file, !is_top);
-
-    uint8 type_stack_locals[locals];
-    // TODO: ここの実装バグの温床なので、なんとかする
-    uint32 *lp = frame->lp;
-    for (i = 0; i < func->param_count; i++) {
-        switch (func->param_types[i]) {
-            case VALUE_TYPE_I32:
-            case VALUE_TYPE_F32:
-                type_stack_locals[i] = 1;
-                break;
-            case VALUE_TYPE_I64:
-            case VALUE_TYPE_F64:
-                type_stack_locals[i] = 2;
-                break;
-            default:
-                type_stack_locals[i] = 4;
-                break;
-        }
-    }
-    uint32 local_base = func->param_count;
-    for (i = 0; i < func->local_count; i++) {
-        switch (func->local_types[i]) {
-            case VALUE_TYPE_I32:
-            case VALUE_TYPE_F32:
-                type_stack_locals[local_base+i] = 1;
-                break;
-            case VALUE_TYPE_I64:
-            case VALUE_TYPE_F64:
-                type_stack_locals[local_base+i] = 2;
-                break;
-            default:
-                type_stack_locals[local_base+i] = 4;
-                break;
-        }
-    }
-    fwrite(&type_stack_locals, sizeof(uint8), locals, fp);
-
-    // uint8 type_stack[full_type_stack_size];
-    // for (i = 0; i < locals; ++i) type_stack[i] = type_stack_locals[i];
-    // // TODO: type_stackをuint8*にする
-    // uint32* tsp_bottom = frame->tsp_bottom;
-    // for (i = 0; i < type_stack_size; ++i) {
-    //     uint8 type = tsp_bottom[i];
-    //     type_stack[locals+i] = type;
-    //     fwrite(&type, sizeof(uint8), 1, fp);
-    // }
-
-    // 内部で持っているtype_stackと索引してきたtype_stackが一致するかチェック
-    // if (full_type_stack_size != type_stack_size_from_file) {
-    //     printf("[ERROR] type_stackのサイズが異なる. %d != %d\n", full_type_stack_size, type_stack_size_from_file);
-    // }
-    // else {
-    //     for (i = 0; i < full_type_stack_size; ++i) {
-    //         if (type_stack[i] != type_stack_from_file[i]) {
-    //             printf("[ERROR] type_stackが異なる\n");
-    //         }
-    //     }
-    // }
+    fwrite(&type_stack_size_from_file, sizeof(uint32), 1, fp);
+    fwrite(&type_stack_from_file, sizeof(uint8), type_stack_size_from_file, fp);
     free(type_stack_from_file);
 
     // 値スタックの中身

@@ -174,20 +174,19 @@ _restore_stack(WASMExecEnv *exec_env, WASMInterpFrame *frame, FILE *fp)
     // 型スタックの中身
     fseek(fp, sizeof(uint8)*locals, SEEK_CUR);                      // localのやつはWAMRでは必要ないので飛ばす
 
+    uint8 type_stack[type_stack_size];
     // uint32* tsp_bottom = frame->tsp_bottom;
-    // for (uint32 i = 0; i < type_stack_size; ++i) {
-    //     uint8 type;
-    //     fread(&type, sizeof(uint8), 1, fp);
-    //     *(tsp_bottom+i) = type;
-    // }
+    for (uint32 i = 0; i < type_stack_size; ++i) {
+        fread(&type_stack[i], sizeof(uint8), 1, fp);
+    }
 
     // 値スタックのサイズ
     // uint32 *tsp = frame->tsp_bottom;
     uint32 value_stack_size = 0;
-    // for (uint32 i = 0; i < type_stack_size; ++i, ++tsp) {
-        // value_stack_size += *tsp;
-    // }
-    // frame->sp = frame->sp_bottom + value_stack_size;
+    for (uint32 i = 0; i < type_stack_size; ++i) {
+        value_stack_size += type_stack[i];
+    }
+    frame->sp = frame->sp_bottom + value_stack_size;
 
     // 値スタックの中身
     uint32 local_cell_num = func->param_cell_num + func->local_cell_num;

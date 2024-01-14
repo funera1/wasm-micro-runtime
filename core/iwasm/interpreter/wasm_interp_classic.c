@@ -1099,7 +1099,18 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
 #if WASM_ENABLE_LABELS_AS_VALUES != 0
 
 #define HANDLE_OP(opcode) HANDLE_##opcode:
-#define FETCH_OPCODE_AND_DISPATCH() goto *handle_table[*frame_ip++]
+
+#define CHECK_DUMP()                                                        \
+    if (sig_flag) {                                                         \
+        goto migration_async;                                               \
+    }
+
+// #define FETCH_OPCODE_AND_DISPATCH() goto *handle_table[*frame_ip++]
+#define FETCH_OPCODE_AND_DISPATCH()                                     \
+do {                                                                    \
+    CHECK_DUMP()                                                        \
+    goto *handle_table[*frame_ip++];                                    \
+} while(0);
 
 #if WASM_ENABLE_THREAD_MGR != 0 && WASM_ENABLE_DEBUG_INTERP != 0
 #define HANDLE_OP_END()                                                   \
@@ -1115,6 +1126,7 @@ wasm_interp_call_func_import(WASMModuleInstance *module_inst,
             wasm_cluster_thread_waiting_run(exec_env);                    \
         }                                                                 \
         os_mutex_unlock(&exec_env->wait_lock);                            \
+        CHECK_DUMP();                                                     \
         goto *handle_table[*frame_ip++];                                  \
     } while (0)
 #else
@@ -1245,15 +1257,19 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
             return;
         }
 
-        // rc = wasm_restore(&module, &exec_env, &cur_func, &prev_frame,
-        //                 &memory, &globals, &global_data, &global_addr,
-        //                 &frame, &frame_ip, &frame_lp, &frame_sp, &frame_csp,
-        //                 &frame_ip_end, &else_addr, &end_addr, &maddr, &done_flag);
-        // if (rc < 0) {
-        //     // error
-        //     perror("failed to restore\n");
-        //     return;
-        // }
+        uint8 *dummy_ip, *dummy_lp, *dummy_sp;
+        rc = wasm_restore(&module, &exec_env, &cur_func, &prev_frame,
+                        &memory, &globals, &global_data, &global_addr,
+                        &frame, &dummy_ip, &dummy_lp, &dummy_sp, &frame_csp,
+                        &frame_ip_end, &else_addr, &end_addr, &maddr, &done_flag);
+        if (rc < 0) {
+            // error
+            perror("failed to restore\n");
+            return;
+        }
+        frame_ip = dummy_ip;
+        frame_lp = dummy_lp;
+        frame_sp = dummy_sp;
         frame->ip = frame_ip;
         linear_mem_size = memory ? memory->memory_data_size : 0;
 
@@ -1270,14 +1286,17 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
 migration_async:
     if (sig_flag) {
         SYNC_ALL_TO_FRAME();
-        // int rc = wasm_dump(exec_env, module, memory, 
-        //     globals, global_data, global_addr, cur_func,
-        //     frame, frame_ip, frame_sp, frame_csp,
-        //     frame_ip_end, else_addr, end_addr, maddr, done_flag);
-        // if (rc < 0) {
-        //     perror("failed to dump\n");
-        //     exit(1);
-        // }
+        uint8 *dummy_ip, *dummy_sp;
+        dummy_ip = frame_ip;
+        dummy_sp = frame_sp;
+        int rc = wasm_dump(exec_env, module, memory, 
+            globals, global_data, global_addr, cur_func,
+            frame, dummy_ip, dummy_sp, frame_csp,
+            frame_ip_end, else_addr, end_addr, maddr, done_flag);
+        if (rc < 0) {
+            perror("failed to dump\n");
+            exit(1);
+        }
         LOG_DEBUG("dispatch_count: %d\n", dispatch_count);
         exit(0);     
     }
